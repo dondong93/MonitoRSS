@@ -1,0 +1,236 @@
+version: "3.8"
+services:
+  mrss-rabbitmq-broker:
+    image: rabbitmq:3-management-alpine
+    container_name: 'mrss-rabbitmq-broker'
+    ports:
+        - 5672:5672
+        - 15672:15672
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 5s
+      timeout: 1s
+      retries: 20
+
+  mrss-mongo:
+    restart: on-failure:5
+    command: mongod --port 27017
+    logging:
+      driver: none
+    image: mongo:latest
+    ports:
+      - "27018:27017"
+    volumes:
+      - "db-mongodb-data:/data/db"
+  
+  mrss-postgres-feed-requests:
+    restart: always
+    healthcheck:
+      test: ["CMD", "pg_isready", "-q", "-d", "postgres", "-U", "postgres"]
+      timeout: 45s
+      interval: 10s
+      retries: 10
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    # Comment below to show logs
+    logging:
+      driver: none
+    image: postgres:14.1-alpine
+    ports:
+      - "5431:5432"
+    volumes:
+      - db-feedrequests-postgres-data:/var/lib/postgresql/data
+      - ./services/feed-requests/sql/setup.sql:/docker-entrypoint-initdb.d/setup.sql
+      
+  mrss-postgres-user-feeds-service:
+    restart: always
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-q', '-d', 'postgres', '-U', 'postgres']
+      timeout: 45s
+      interval: 10s
+      retries: 10
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    # Comment below to show logs
+    logging:
+      driver: none
+    image: postgres:14.1-alpine
+    ports:
+      - '5430:5432'
+    volumes:
+      - db-user-feeds-postgres-data:/var/lib/postgresql/data
+      - ./services/user-feeds/sql/setup.sql:/docker-entrypoint-initdb.d/setup.sql
+
+  mrss-discord-rest-listener:
+    restart: on-failure:3
+    build:
+      context: services/discord-rest-listener
+      dockerfile: Dockerfile
+      target: build
+    volumes:
+      - ./services/discord-rest-listener:/usr/src/app
+      - /usr/src/app/node_modules/
+    depends_on:
+      mrss-rabbitmq-broker:
+        condition: service_healthy
+      mrss-mongo:
+        condition: service_started
+    command: npm start
+    env_file:
+      - ./.env.local
+    environment:
+      - DISCORD_REST_LISTENER_RABBITMQ_URI=amqp://mrss-rabbitmq-broker:5672
+      - DISCORD_REST_LISTENER_MONGO_URI=mongodb://mrss-mongo:27017/rss
+
+  mrss-feed-requests-service:
+    restart: on-failure:3
+    build:
+      context: services/feed-requests
+      dockerfile: Dockerfile
+      target: build
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./services/feed-requests:/usr/src/app
+      - /usr/src/app/node_modules/
+    command: npm run start:local
+    depends_on:
+      mrss-postgres-feed-requests:
+        condition: service_started
+      mrss-rabbitmq-broker:
+        condition: service_healthy
+    env_file:
+      - ./.env.local
+    environment:
+      - FEED_REQUESTS_POSTGRES_URI=postgres://postgres:postgres@mrss-postgres-feed-requests:5432/feedrequests
+      - FEED_REQUESTS_FEEDS_MONGODB_URI=mongodb://mrss-mongo:27017/rss
+      - FEED_REQUESTS_API_KEY=feed-requests-api-key
+      - FEED_REQUESTS_API_PORT=5000
+      # - FEED_REQUESTS_SYNC_DB=true
+      - FEED_REQUESTS_RABBITMQ_BROKER_URL=amqp://mrss-rabbitmq-broker:5672
+      - FEED_REQUESTS_FEED_REQUEST_DEFAULT_USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 MonitoRSS/1.0"
+      - FEED_REQUESTS_FAILED_REQUEST_DURATION_THRESHOLD_HOURS=0.02
+
+  mrss-user-feeds-service:
+    restart: on-failure:3
+    build:
+      context: services/user-feeds
+      dockerfile: Dockerfile
+      target: build
+    ports:
+      - "5001:5000"
+    volumes:
+      - ./services/user-feeds:/usr/src/app
+      - /usr/src/app/node_modules/
+    command: npm run start:local
+    depends_on:
+      - mrss-postgres-user-feeds-service
+      - mrss-feed-requests-service
+      - mrss-rabbitmq-broker
+    env_file:
+      - ./.env.local
+    environment:
+      - USER_FEEDS_POSTGRES_URI=postgres://postgres:postgres@mrss-postgres-user-feeds-service:5432
+      - USER_FEEDS_DISCORD_RABBITMQ_URI=amqp://mrss-rabbitmq-broker:5672
+      - USER_FEEDS_POSTGRES_DATABASE=userfeeds
+      - USER_FEEDS_API_PORT=5000
+      - USER_FEEDS_RABBITMQ_BROKER_URL=amqp://guest:guest@mrss-rabbitmq-broker:5672
+      - USER_FEEDS_FEED_REQUESTS_API_URL=http://mrss-feed-requests-service:5000/v1/feed-requests
+      - USER_FEEDS_FEED_REQUESTS_API_KEY=feed-requests-api-key
+      - USER_FEEDS_API_KEY=user-feeds-api-key
+
+  # Schedule emitter
+  mrss-schedule-emitter-service:
+    build:
+      context: services/backend-api
+      dockerfile: dockerfiles/web/api.Dockerfile
+      target: build
+    restart: on-failure:3
+    volumes:
+      - ./services/backend-api:/usr/src/app
+      - /usr/src/app/node_modules/
+    depends_on:
+      - mrss-mongo
+    env_file:
+      - ./.env.local
+    environment:
+      - NODE_ENV=local
+      - BACKEND_API_MONGODB_URI=mongodb://mrss-mongo:27017/rss
+      - BACKEND_API_USER_FEEDS_API_HOST=----IRRELEVANT----
+      - BACKEND_API_USER_FEEDS_API_KEY=----IRRELEVANT----
+      - BACKEND_API_FEED_REQUESTS_API_HOST=----IRRELEVANT----
+      - BACKEND_API_FEED_REQUESTS_API_KEY=----IRRELEVANT----
+      - BACKEND_API_LOGIN_REDIRECT_URI=----IRRELEVANT----
+      - BACKEND_API_DISCORD_REDIRECT_URI=----IRRELEVANT----
+      - BACKEND_API_DEFAULT_REFRESH_RATE_MINUTES=0.1
+      - BACKEND_API_DEFAULT_MAX_FEEDS=10
+      - BACKEND_API_FEED_USER_AGENT=----IRRELEVANT----
+      - BACKEND_API_RABBITMQ_BROKER_URL=amqp://guest:guest@mrss-rabbitmq-broker:5672/
+      - BACKEND_API_MAX_DAILY_ARTICLES_DEFAULT=50
+    command: npm run start:schedule-emitter:local
+
+  # Web - Backend api
+  mrss-web-api:
+    build:
+      context: services/backend-api
+      dockerfile: dockerfiles/web/api.Dockerfile
+      target: build
+    restart: on-failure:3
+    volumes:
+      - ./services/backend-api:/usr/src/app
+      - /usr/src/app/node_modules/
+    depends_on:
+      - mrss-mongo
+      - mrss-user-feeds-service
+      - mrss-feed-requests-service
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./.env.local
+    environment:
+      - BACKEND_API_NODE_ENV=local
+      - BACKEND_API_PORT=8000
+      - BACKEND_API_MONGODB_URI=mongodb://mrss-mongo:27017/rss
+      - BACKEND_API_USER_FEEDS_API_HOST=http://mrss-user-feeds-service:5000
+      - BACKEND_API_FEED_REQUESTS_API_HOST=http://mrss-feed-requests-service:5000
+      - BACKEND_API_LOGIN_REDIRECT_URI=http://localhost:8000
+      - BACKEND_API_DISCORD_REDIRECT_URI=http://localhost:8000/api/v1/discord/callback
+      - BACKEND_API_DEFAULT_REFRESH_RATE_MINUTES=0.1
+      - BACKEND_API_DEFAULT_MAX_FEEDS=10
+      - BACKEND_API_FEED_USER_AGENT=MonitoRSS
+      - BACKEND_API_RABBITMQ_BROKER_URL=amqp://guest:guest@mrss-rabbitmq-broker:5672/
+      - BACKEND_API_DEFAULT_MAX_USER_FEEDS=1
+      - BACKEND_API_MAX_DAILY_ARTICLES_DEFAULT=50
+      - BACKEND_API_USER_FEEDS_API_KEY=user-feeds-api-key
+      - BACKEND_API_FEED_REQUESTS_API_KEY=feed-requests-api-key
+    command: npm run start:local
+
+  mrss-web-client:
+    build:
+      context: services/backend-api/client
+      dockerfile: ../dockerfiles/web/client.Dockerfile
+      target: build
+    restart: on-failure:3
+    ports:
+      - "3000:3000"
+    expose:
+      - "3000"
+    environment:
+      - NODE_ENV=local
+      - HOST=0.0.0.0
+      - API_PROXY_URL=http://mrss-web-api:8000
+      - VITE_USE_POLLING=true
+    depends_on:
+      - mrss-web-api
+    volumes:
+      - ./services/backend-api/client:/usr/src/app
+      - /usr/src/app/node_modules/
+    command: npx vite --host
+
+volumes:
+  db-mongodb-data:
+  db-feedrequests-postgres-data:
+  db-user-feeds-postgres-data:
+    driver: local
